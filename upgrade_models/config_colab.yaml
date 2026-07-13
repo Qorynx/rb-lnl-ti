@@ -1,0 +1,73 @@
+# Persistent Colab configuration. The setup notebook mounts Drive before use.
+seed: 42
+data:
+  root: /content/drive/MyDrive/rb-lnl-ti/data
+  validation_fraction: 0.1
+  num_workers: 2
+  pin_memory: true
+
+model:
+  num_classes: 43
+  image_size: 224
+  embed_dim: 192
+  depth: 12
+  drop_path_rate: 0.08
+  residual_hidden_dim: 256
+  residual_gate_hidden_dim: 64
+  residual_dropout: 0.1
+  residual_scale_init: -2.0
+  residual_gate_init: -1.5
+
+train:
+  epochs: 140
+  batch_size: 8
+  accumulation_steps: 4
+  amp: true
+  optimizer: adamw
+  learning_rate: 0.0003
+  minimum_learning_rate: 0.000001
+  weight_decay: 0.04
+  warmup_epochs: 8
+  label_smoothing: 0.03
+  gradient_clip_norm: 1.0
+
+ema:
+  enabled: true
+  decay: 0.9998
+
+hard_example:
+  alpha: 1.0
+  max_weight: 2.5
+
+residual_correction:
+  base_preservation_weight: 0.02
+  residual_l2_weight: 0.0001
+
+stages:
+  stage1:
+    start_epoch: 0
+    end_epoch: 89
+    learning_rate: 0.0003
+    label_smoothing: 0.03
+  stage2:
+    start_epoch: 90
+    end_epoch: 109
+    learning_rate: 0.0001
+    label_smoothing: 0.03
+  stage3:
+    start_epoch: 110
+    end_epoch: 124
+    late_backbone_learning_rate: 0.00001
+    base_head_learning_rate: 0.00005
+    residual_learning_rate: 0.0002
+    label_smoothing: 0.03
+  stage4:
+    start_epoch: 125
+    end_epoch: 139
+    learning_rate: 0.00001
+    minimum_learning_rate: 0.000001
+    label_smoothing: 0.01
+
+output:
+  root: /content/drive/MyDrive/rb-lnl-ti/submission
+  results: /content/drive/MyDrive/rb-lnl-ti/submission/results

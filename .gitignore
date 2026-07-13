@@ -1,0 +1,14 @@
+# Training data and checkpoints
+data/
+submission/
+
+# Python and notebook runtime artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local environments
+.venv/
+venv/
+env/

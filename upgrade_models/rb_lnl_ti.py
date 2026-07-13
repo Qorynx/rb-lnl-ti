@@ -1,70 +1,102 @@
-import torch
-import torch.nn as nn
-from models.tnt import TNT
+"""RB-LNL-Ti wrapper.
 
-# Import the original LNL_Ti factory function
+The base implementation is intentionally imported unchanged from ``LNL.py``.
+This file owns only the upgrade head and its inference/training interface.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import nn
+
 from LNL import LNL_Ti
 
+
 class RB_LNL_Ti(nn.Module):
-    def __init__(self, num_classes=43, pretrained=False, **kwargs):
-        """
-        Residual-Boosted Locality-iN-Locality Tiny (RB-LNL-Ti)
-        
-        Args:
-            num_classes (int): Number of target classes. GTSRB uses 43.
-            pretrained (bool): Whether to load pre-trained weights for the backbone.
-        """
+    """LNL-Ti with a confidence-gated residual correction head.
+
+    The gate is initialized small, so the model starts as the original base
+    classifier.  During Stage 3 it learns when a residual correction is useful
+    instead of applying the same correction strength to every sample.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 43,
+        pretrained: bool = False,
+        residual_hidden_dim: int = 256,
+        residual_gate_hidden_dim: int = 64,
+        residual_dropout: float = 0.1,
+        residual_scale_init: float = -2.0,
+        residual_gate_init: float = -1.5,
+        residual_enabled: bool = True,
+        **kwargs,
+    ):
         super().__init__()
-        
-        # Load the base backbone from original LNL_Ti
         self.backbone = LNL_Ti(pretrained=pretrained, num_classes=num_classes, **kwargs)
-        
-        # LNL_Ti embed_dim is 192 (from tnt_t_conv_patch16_224 config)
         self.embed_dim = self.backbone.embed_dim
-        
-        # The base head is already initialized in the backbone (self.backbone.head)
-        # It handles 192 -> 43 prediction.
-        
-        # Residual correction head
+        self.num_classes = num_classes
+
         self.residual_head = nn.Sequential(
             nn.LayerNorm(self.embed_dim),
-            nn.Linear(self.embed_dim, 256),
+            nn.Linear(self.embed_dim, residual_hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, num_classes)
+            nn.Dropout(residual_dropout),
+            nn.Linear(residual_hidden_dim, num_classes),
         )
-        
-        # Residual scale initialized to -2.0 as per the plan
-        self.residual_scale = nn.Parameter(torch.tensor(-2.0))
-        
-        # Flag to control if residual head is used during forward pass
-        self.use_residual = False
+        self.residual_gate = nn.Sequential(
+            nn.LayerNorm(self.embed_dim),
+            nn.Linear(self.embed_dim, residual_gate_hidden_dim),
+            nn.GELU(),
+            nn.Linear(residual_gate_hidden_dim, 1),
+        )
+        nn.init.constant_(self.residual_gate[-1].bias, residual_gate_init)
+        self.residual_scale = nn.Parameter(torch.tensor(float(residual_scale_init)))
 
-    def forward(self, x, vis=False):
-        """
-        Forward pass.
-        
-        If self.use_residual is False, only base_logits are returned.
-        If self.use_residual is True, logits = base_logits + alpha * residual_logits.
-        """
-        # forward_features in TNT returns (features, attn_weights)
+        # A buffer makes the stage/inference mode part of state_dict.  A fresh
+        # model defaults to the final product mode: residual correction on.
+        self.register_buffer(
+            "residual_enabled",
+            torch.tensor(1 if residual_enabled else 0, dtype=torch.uint8),
+            persistent=True,
+        )
+
+    def set_residual_enabled(self, enabled: bool) -> None:
+        self.residual_enabled.fill_(1 if enabled else 0)
+
+    def is_residual_enabled(self) -> bool:
+        return bool(self.residual_enabled.item())
+
+    def forward(self, x, vis: bool = False, return_aux: bool = False):
         features, attn_weights = self.backbone.forward_features(x)
-        
-        # Base prediction
         base_logits = self.backbone.head(features)
-        
-        if not self.use_residual:
+
+        if not self.is_residual_enabled():
+            if return_aux:
+                return base_logits, {
+                    "logits": base_logits,
+                    "base_logits": base_logits,
+                    "residual_logits": torch.zeros_like(base_logits),
+                    "gate": torch.zeros((x.size(0), 1), device=x.device),
+                    "alpha": base_logits.new_zeros(()),
+                }
             if vis:
                 return base_logits, attn_weights
             return base_logits
-            
-        # Residual prediction
+
         residual_logits = self.residual_head(features)
+        gate = torch.sigmoid(self.residual_gate(features))
         alpha = torch.sigmoid(self.residual_scale)
-        
-        # Final prediction
-        logits = base_logits + alpha * residual_logits
-        
+        logits = base_logits + alpha * gate * residual_logits
+
+        if return_aux:
+            return logits, {
+                "logits": logits,
+                "base_logits": base_logits,
+                "residual_logits": residual_logits,
+                "gate": gate,
+                "alpha": alpha,
+            }
         if vis:
             return logits, attn_weights
         return logits
@@ -72,15 +104,11 @@ class RB_LNL_Ti(nn.Module):
     def get_classifier(self):
         return self.backbone.head
 
-    def reset_classifier(self, num_classes, global_pool=''):
+    def reset_classifier(self, num_classes: int, global_pool: str = ""):
         self.backbone.reset_classifier(num_classes, global_pool)
-        
-        # We also need to reset the residual head's last linear layer
-        self.residual_head[-1] = nn.Linear(256, num_classes)
+        self.num_classes = num_classes
+        self.residual_head[-1] = nn.Linear(self.residual_head[-1].in_features, num_classes)
 
-def rb_lnl_ti(pretrained=False, **kwargs):
-    """
-    Factory function for RB-LNL-Ti model.
-    """
-    model = RB_LNL_Ti(pretrained=pretrained, **kwargs)
-    return model
+
+def rb_lnl_ti(pretrained: bool = False, **kwargs) -> RB_LNL_Ti:
+    return RB_LNL_Ti(pretrained=pretrained, **kwargs)
