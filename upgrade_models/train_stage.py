@@ -343,6 +343,36 @@ def run_stage(stage: str, config_path: Optional[str] = None, resume: bool = Fals
     return {"stage": stage, "best_validation": best_accuracy, "path": str(best_path)}
 
 
+def run_all_stages(config_path: Optional[str] = None, resume: bool = True):
+    """Run the complete 4-stage workflow from one notebook entrypoint."""
+    results = []
+    for stage in ("stage1", "stage2", "stage3", "stage4"):
+        results.append(run_stage(stage, config_path=config_path, resume=resume))
+    return results
+
+
+def evaluate_checkpoint(config_path: str, checkpoint_path: str):
+    """Load a final checkpoint and evaluate it on official GTSRB test data."""
+    config = load_config(config_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _, loaders = _make_loaders(config, clean=True, include_test=True)
+    model = _model(config, residual_enabled=True).to(device)
+    _load_weights(model, Path(checkpoint_path), device)
+    model.set_residual_enabled(True)
+    metrics = evaluate(model, loaders["test"], device)
+    results_dir = Path(config["output"]["results"])
+    confusion = log_predictions(
+        model,
+        loaders["test"],
+        device,
+        str(results_dir / "predictions.csv"),
+        int(config["model"]["num_classes"]),
+    )
+    confusion.to_csv(results_dir / "confusion_matrix.csv", index=False)
+    save_metrics(str(results_dir / "metrics.json"), {"official_test": metrics})
+    return metrics
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train one RB-LNL-Ti stage")
     parser.add_argument("stage", choices=["stage1", "stage2", "stage3", "stage4"])
@@ -350,14 +380,6 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     run_stage(args.stage, args.config, resume=args.resume)
-
-
-def wrapper_main(stage: str) -> None:
-    parser = argparse.ArgumentParser(description=f"Train {stage}")
-    parser.add_argument("--config", default=None)
-    parser.add_argument("--resume", action="store_true")
-    args = parser.parse_args()
-    run_stage(stage, args.config, resume=args.resume)
 
 
 if __name__ == "__main__":

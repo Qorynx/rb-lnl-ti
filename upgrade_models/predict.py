@@ -15,15 +15,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from upgrade_models.rb_lnl_ti import RB_LNL_Ti
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Predict GTSRB labels for new images")
     parser.add_argument("images", nargs="+", help="Image paths")
     parser.add_argument("--checkpoint", default="./submission/rb_lnl_ti_gtsrb.pth")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     args = parser.parse_args()
+    from upgrade_models.rb_lnl_ti import RB_LNL_Ti
 
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device if args.device != "auto" else "cpu")
     model = RB_LNL_Ti(num_classes=43).to(device)
