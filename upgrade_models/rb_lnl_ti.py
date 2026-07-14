@@ -12,6 +12,18 @@ from torch import nn
 from LNL import LNL_Ti
 
 
+def _moment_exchange(features: torch.Tensor, strength: float, permutation=None) -> torch.Tensor:
+    if features.ndim < 2 or features.size(0) < 2 or strength <= 0:
+        return features
+    dims = tuple(range(1, features.ndim))
+    mean = features.mean(dim=dims, keepdim=True)
+    std = features.var(dim=dims, unbiased=False, keepdim=True).add(1e-6).sqrt()
+    if permutation is None:
+        permutation = torch.randperm(features.size(0), device=features.device)
+    exchanged = (features - mean) / std * std[permutation] + mean[permutation]
+    return features + float(max(0.0, min(1.0, strength))) * (exchanged - features)
+
+
 class RB_LNL_Ti(nn.Module):
     """LNL-Ti with a confidence-gated residual correction head.
 
@@ -67,8 +79,18 @@ class RB_LNL_Ti(nn.Module):
     def is_residual_enabled(self) -> bool:
         return bool(self.residual_enabled.item())
 
-    def forward(self, x, vis: bool = False, return_aux: bool = False):
+    def forward(
+        self,
+        x,
+        vis: bool = False,
+        return_aux: bool = False,
+        moex_strength: float = 0.0,
+        moex_permutation=None,
+    ):
         features, attn_weights = self.backbone.forward_features(x)
+        raw_features = features
+        if self.training and moex_strength > 0:
+            features = _moment_exchange(features, moex_strength, moex_permutation)
         base_logits = self.backbone.head(features)
 
         if not self.is_residual_enabled():
@@ -79,6 +101,8 @@ class RB_LNL_Ti(nn.Module):
                     "residual_logits": torch.zeros_like(base_logits),
                     "gate": torch.zeros((x.size(0), 1), device=x.device),
                     "alpha": base_logits.new_zeros(()),
+                    "features": features,
+                    "raw_features": raw_features,
                 }
             if vis:
                 return base_logits, attn_weights
@@ -96,6 +120,8 @@ class RB_LNL_Ti(nn.Module):
                 "residual_logits": residual_logits,
                 "gate": gate,
                 "alpha": alpha,
+                "features": features,
+                "raw_features": raw_features,
             }
         if vis:
             return logits, attn_weights

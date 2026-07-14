@@ -44,13 +44,41 @@ def main() -> None:
 
     exported_checkpoint = output / "rb_lnl_ti_gtsrb.pth"
     torch.save(model.state_dict(), exported_checkpoint)
-    for filename in ("rb_lnl_ti.py", "requirements.txt", "README.md"):
-        source = Path(__file__).with_name(filename)
+    source_upgrade = Path(__file__).resolve().parent
+    source_root = source_upgrade.parent
+    for filename in ("LNL.py", "LNL_MoEx.py"):
+        source = source_root / filename
         if source.exists():
             shutil.copy2(source, output / filename)
+    if (source_root / "models").exists():
+        shutil.copytree(
+            source_root / "models",
+            output / "models",
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+
+    for filename in ("rb_lnl_ti.py", "requirements.txt", "README.md"):
+        source = source_upgrade / filename
+        if source.exists():
+            shutil.copy2(source, output / filename)
+    shutil.copy2(source_upgrade / "config.yaml", output / "config.yaml")
+
+    # Keep the complete upgrade package so the supplied notebook can train or
+    # evaluate from the exported directory, while the root model file remains
+    # directly importable by the upstream Instructions notebook.
+    shutil.copytree(
+        source_upgrade,
+        output / "upgrade_models",
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
     notebook = Path(__file__).with_name("Instructions_RB_LNL_Ti.ipynb")
     if notebook.exists():
         shutil.copy2(notebook, output / notebook.name)
+    results_source = checkpoint_path.parent / "results"
+    if results_source.exists():
+        shutil.copytree(results_source, output / "results", dirs_exist_ok=True)
 
     manifest = {
         "model": "RB-LNL-Ti",

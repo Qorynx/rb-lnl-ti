@@ -10,7 +10,16 @@ This folder contains the upgrade only. The original implementation in
 - Stage 1 logs difficulty for train samples and confusion for validation only.
 - Stage 2 applies clipped hard-example weights with correct original indices.
 - Stage 3 uses a confidence-gated residual head and a small base-preservation
-  loss instead of a hard-coded confusion-pair loss.
+  loss plus validation-derived confusion-pair margin loss.
+- Stage 1 applies pooled-feature MoEx with a decaying probability and disables
+  it before the clean stages. A group manifest can be supplied when GTSRB
+  metadata contains track/sequence IDs; otherwise the split is explicitly
+  recorded as stratified-random because torchvision does not expose them.
+- The A0-A7 ablation runner uses validation only. It does not read the official
+  test set until the final selected configuration is evaluated.
+- Optional checkpoint averaging and translation-only TTA are reported as
+  ablation variants; neither is silently used to choose a checkpoint from the
+  official test set.
 - EMA, AMP, gradient accumulation, warm-up, checkpoint resume, and artifact
   logging are shared across stages.
 - A fresh `RB_LNL_Ti()` uses residual correction by default and returns
@@ -52,6 +61,11 @@ The notebook calls all stages with resume enabled, so it continues from the
 latest checkpoint. Do not commit the Drive-backed `data/` or `submission/`
 directories to GitHub.
 
+If an external GTSRB metadata file provides sequence/track groups, set
+`data.group_manifest` in the config to a CSV with exactly two columns:
+`image_id,group_id`. The split manifest records whether group-aware splitting
+was actually applied.
+
 ## Run one stage from Python (advanced/debug only)
 
 ```powershell
@@ -67,7 +81,29 @@ python -m upgrade_models.train_stage stage2 --config upgrade_models/config.yaml 
 The scripts write checkpoints under `submission/` and analysis artifacts under
 `submission/results/`. The official test is evaluated only at the end of Stage
 4 and is written to `submission/results/metrics.json`, together with
-`predictions.csv` and the final `confusion_matrix.csv`.
+`predictions.csv`, `test_result.png`, `split_manifest.json`,
+`sample_difficulty.csv`, `confusion_pairs.json`, and the final
+`confusion_matrix.csv`.
+
+## Ablation matrix
+
+Materialize the complete A0-A7 plan without training first:
+
+```powershell
+python -m upgrade_models.run_ablation --dry-run
+```
+
+Run selected variants on validation only:
+
+```powershell
+python -m upgrade_models.run_ablation --variants A0,A1,A2,A3,A4,A5,A6,A7 --resume
+```
+
+The result is stored under `submission/ablations/ablation_plan.json`. Select a
+variant from validation, then run the normal Colab notebook with that
+configuration before reporting official test accuracy. This separation is
+important: comparing A0-A7 on the official test would turn the test set into a
+hyperparameter-selection set.
 
 ## Export a plug-and-play model
 
@@ -79,8 +115,11 @@ python upgrade_models/export_submission.py `
   --output /content/drive/MyDrive/rb-lnl-ti/submission_export
 ```
 
-The export contains `rb_lnl_ti.py`, a pure `rb_lnl_ti_gtsrb.pth`
-`state_dict`, a manifest, and `Instructions_RB_LNL_Ti.ipynb`.
+The export contains the root `rb_lnl_ti.py`, the untouched base dependencies
+(`LNL.py` and `models/`), a pure `rb_lnl_ti_gtsrb.pth` `state_dict`, the full
+`upgrade_models/` package, a manifest, config, results when available, and
+`Instructions_RB_LNL_Ti.ipynb`. This makes both the upstream model-cell
+workflow and the unified project notebook runnable from the exported folder.
 
 The original upstream notebook creates a base `LNL_Ti` and replaces its head.
 For RB-LNL-Ti, replace that model cell with:

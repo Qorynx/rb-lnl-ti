@@ -3,6 +3,7 @@ seed: 42
 data:
   root: /content/drive/MyDrive/rb-lnl-ti/data
   validation_fraction: 0.1
+  group_manifest: null
   num_workers: 2
   pin_memory: true
 
@@ -35,6 +36,23 @@ ema:
   enabled: true
   decay: 0.9998
 
+features:
+  ema_enabled: true
+  moex_enabled: true
+  hard_example_enabled: true
+  residual_enabled: true
+  pairwise_margin_enabled: true
+  clean_calibration_enabled: true
+  checkpoint_averaging_enabled: false
+  tta_enabled: false
+
+moex:
+  enabled: true
+  probability_start: 0.60
+  probability_end: 0.00
+  lambda: 0.90
+  disable_last_epochs: 15
+
 hard_example:
   alpha: 1.0
   max_weight: 2.5
@@ -42,6 +60,17 @@ hard_example:
 residual_correction:
   base_preservation_weight: 0.02
   residual_l2_weight: 0.0001
+
+pairwise_margin:
+  enabled: true
+  weight: 0.05
+  margin: 0.20
+  max_pairs: 32
+  min_count: 1
+
+checkpoint_averaging:
+  enabled: false
+  top_k: 3
 
 stages:
   stage1:
@@ -71,3 +100,6 @@ stages:
 output:
   root: /content/drive/MyDrive/rb-lnl-ti/submission
   results: /content/drive/MyDrive/rb-lnl-ti/submission/results
+
+evaluation:
+  run_official_test: true

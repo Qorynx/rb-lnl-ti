@@ -11,8 +11,9 @@ import json
 import os
 import random
 import sys
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -86,6 +87,68 @@ def _stratified_split(targets: np.ndarray, val_fraction: float, seed: int) -> Tu
     return np.asarray(sorted(train_indices)), np.asarray(sorted(val_indices))
 
 
+def _group_stratified_split(
+    targets: np.ndarray, groups: Sequence[str], val_fraction: float, seed: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Split complete groups while preserving class proportions.
+
+    A group manifest is optional because torchvision's GTSRB wrapper does not
+    expose track/sequence IDs.  When a manifest is supplied, every group must
+    belong to one class; silently mixing labels inside a group would make the
+    split contract ambiguous.
+    """
+    group_array = np.asarray(groups).astype(str)
+    if len(group_array) != len(targets):
+        raise ValueError("group manifest must contain one group_id per train image")
+    labels_by_group: Dict[str, set[int]] = defaultdict(set)
+    indices_by_group: Dict[str, list[int]] = defaultdict(list)
+    for index, (label, group) in enumerate(zip(targets, group_array)):
+        labels_by_group[group].add(int(label))
+        indices_by_group[group].append(index)
+    mixed = [group for group, labels in labels_by_group.items() if len(labels) != 1]
+    if mixed:
+        raise ValueError(f"group manifest contains groups with multiple labels: {mixed[:5]}")
+
+    rng = np.random.default_rng(seed)
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+    for label in np.unique(targets):
+        label_groups = [group for group, labels in labels_by_group.items() if label in labels]
+        rng.shuffle(label_groups)
+        target_val = max(1, int(round(int((targets == label).sum()) * val_fraction)))
+        accumulated = 0
+        selected: list[str] = []
+        for group in label_groups:
+            if accumulated >= target_val and selected:
+                break
+            selected.append(group)
+            accumulated += len(indices_by_group[group])
+        selected_set = set(selected)
+        for group in label_groups:
+            (val_indices if group in selected_set else train_indices).extend(indices_by_group[group])
+    return np.asarray(sorted(train_indices)), np.asarray(sorted(val_indices))
+
+
+def _load_group_manifest(path: Optional[str | os.PathLike[str]], size: int) -> Optional[np.ndarray]:
+    if not path:
+        return None
+    manifest = pd.read_csv(path)
+    required = {"image_id", "group_id"}
+    if not required.issubset(manifest.columns):
+        raise ValueError(f"group manifest must contain columns {sorted(required)}")
+    if manifest["image_id"].duplicated().any():
+        raise ValueError("group manifest contains duplicate image_id values")
+    groups = np.empty(size, dtype=object)
+    groups[:] = None
+    for row in manifest.itertuples(index=False):
+        image_id = int(row.image_id)
+        if 0 <= image_id < size:
+            groups[image_id] = str(row.group_id)
+    if any(value is None for value in groups):
+        raise ValueError("group manifest does not cover every GTSRB train image")
+    return groups
+
+
 def build_transforms(train: bool, clean: bool = False):
     if train and not clean:
         transform = transforms.Compose(
@@ -113,12 +176,107 @@ def build_transforms(train: bool, clean: bool = False):
     return transform
 
 
+def moment_exchange(features: torch.Tensor, strength: float = 0.9, permutation: Optional[torch.Tensor] = None):
+    """Exchange per-sample feature moments, with a controllable blend.
+
+    This is deliberately applied to the pooled 192-dimensional representation,
+    rather than to pixels or the untouched transformer blocks.  It regularizes
+    the base representation while preserving the model's public interface.
+    """
+    if features.ndim < 2 or features.size(0) < 2 or strength <= 0:
+        return features
+    dims = tuple(range(1, features.ndim))
+    mean = features.mean(dim=dims, keepdim=True)
+    std = features.var(dim=dims, unbiased=False, keepdim=True).add(1e-6).sqrt()
+    normalized = (features - mean) / std
+    if permutation is None:
+        permutation = torch.randperm(features.size(0), device=features.device)
+    exchanged = normalized * std[permutation] + mean[permutation]
+    strength = float(np.clip(strength, 0.0, 1.0))
+    return features + strength * (exchanged - features)
+
+
+def pairwise_margin_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    confusion_pairs: Mapping[int, Sequence[int]],
+    margin: float = 0.2,
+) -> torch.Tensor:
+    """Penalize only validation-supported confusions for their true class."""
+    losses = []
+    for true_label, confused_labels in confusion_pairs.items():
+        mask = targets == int(true_label)
+        if not mask.any():
+            continue
+        for confused_label in confused_labels:
+            losses.append(
+                F.relu(
+                    float(margin)
+                    - logits[mask, int(true_label)]
+                    + logits[mask, int(confused_label)]
+                ).mean()
+            )
+    if not losses:
+        return logits.new_zeros(())
+    return torch.stack(losses).mean()
+
+
+def confusion_pairs_from_matrix(
+    matrix: pd.DataFrame | np.ndarray,
+    max_pairs: int = 32,
+    min_count: int = 1,
+) -> Dict[int, list[int]]:
+    values = matrix.to_numpy() if isinstance(matrix, pd.DataFrame) else np.asarray(matrix)
+    candidates = []
+    for true_label in range(values.shape[0]):
+        for predicted_label in range(values.shape[1]):
+            if true_label != predicted_label and int(values[true_label, predicted_label]) >= min_count:
+                candidates.append((int(values[true_label, predicted_label]), true_label, predicted_label))
+    candidates.sort(reverse=True)
+    pairs: Dict[int, list[int]] = defaultdict(list)
+    for _, true_label, predicted_label in candidates[:max_pairs]:
+        pairs[true_label].append(predicted_label)
+    return {int(key): value for key, value in pairs.items()}
+
+
+def save_confusion_pairs(path: str, pairs: Mapping[int, Sequence[int]]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with Path(path).open("w", encoding="utf-8") as handle:
+        json.dump({str(key): [int(value) for value in values] for key, values in pairs.items()}, handle, indent=2)
+
+
+def load_confusion_pairs(path: str) -> Dict[int, list[int]]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return {int(key): [int(value) for value in values] for key, values in payload.items()}
+
+
+def _translate_tensor(images: torch.Tensor, shift_x: int) -> torch.Tensor:
+    if shift_x == 0:
+        return images
+    shifted = torch.zeros_like(images)
+    if shift_x > 0:
+        shifted[..., shift_x:] = images[..., :-shift_x]
+    else:
+        shifted[..., :shift_x] = images[..., -shift_x:]
+    return shifted
+
+
+def predict_logits(model: nn.Module, images: torch.Tensor, tta: bool = False) -> torch.Tensor:
+    if not tta:
+        return model(images)
+    # Translation-only TTA respects the plan's no-horizontal-flip constraint.
+    views = [images, _translate_tensor(images, -2), _translate_tensor(images, 2)]
+    return torch.stack([model(view) for view in views], dim=0).mean(dim=0)
+
+
 def build_gtsrb_splits(
     data_dir: str,
     val_fraction: float,
     seed: int,
     clean: bool = False,
     include_test: bool = False,
+    group_manifest: Optional[str | os.PathLike[str]] = None,
 ):
     """Create train/validation datasets and optionally the official test set."""
 
@@ -126,7 +284,15 @@ def build_gtsrb_splits(
     data_root.mkdir(parents=True, exist_ok=True)
     train_meta = datasets.GTSRB(root=data_root, split="train", transform=None, download=True)
     targets = _targets_from_dataset(train_meta)
-    train_indices, val_indices = _stratified_split(targets, val_fraction, seed)
+    groups = _load_group_manifest(group_manifest, len(train_meta))
+    if groups is None:
+        train_indices, val_indices = _stratified_split(targets, val_fraction, seed)
+        split_strategy = "stratified_random"
+        split_note = "No track/sequence metadata was supplied; torchvision GTSRB uses stratified random split."
+    else:
+        train_indices, val_indices = _group_stratified_split(targets, groups, val_fraction, seed)
+        split_strategy = "group_stratified"
+        split_note = "Validation groups are disjoint from training groups."
 
     train_base = datasets.GTSRB(
         root=data_root, split="train", transform=build_transforms(True, clean=clean), download=False
@@ -140,11 +306,28 @@ def build_gtsrb_splits(
         "train_indices": train_indices,
         "val_indices": val_indices,
         "full_train_size": len(train_meta),
+        "group_ids": groups,
+        "split_strategy": split_strategy,
+        "split_note": split_note,
     }
     if include_test:
         test_base = datasets.GTSRB(root=data_root, split="test", transform=build_transforms(False), download=True)
         result["test"] = IndexedDataset(test_base, np.arange(len(test_base)))
     return result
+
+
+def save_split_manifest(splits: Mapping[str, Any], path: str) -> None:
+    """Persist the exact split and whether a group-aware manifest was used."""
+    payload = {
+        "split_strategy": splits["split_strategy"],
+        "split_note": splits["split_note"],
+        "full_train_size": int(splits["full_train_size"]),
+        "train_indices": [int(value) for value in splits["train_indices"]],
+        "validation_indices": [int(value) for value in splits["val_indices"]],
+        "group_aware": splits["group_ids"] is not None,
+    }
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def make_loader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int, pin_memory: bool) -> DataLoader:
@@ -212,7 +395,13 @@ def cosine_with_warmup(optimizer: Optimizer, warmup_epochs: int, total_epochs: i
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, ema: Optional[ModelEMA] = None):
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    ema: Optional[ModelEMA] = None,
+    tta: bool = False,
+):
     model.eval()
     if ema is not None:
         ema.store(model)
@@ -224,7 +413,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, ema: Op
         for images, targets, _ in loader:
             images, targets = images.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             with autocast_context(device, enabled=False):
-                logits = model(images)
+                logits = predict_logits(model, images, tta=tta)
                 loss = F.cross_entropy(logits, targets)
             loss_sum += float(loss.item()) * targets.size(0)
             correct += int(logits.argmax(dim=1).eq(targets).sum().item())
@@ -236,7 +425,14 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, ema: Op
 
 
 @torch.no_grad()
-def log_difficulty(model: nn.Module, loader: DataLoader, device: torch.device, path: str, ema: Optional[ModelEMA] = None):
+def log_difficulty(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    path: Optional[str] = None,
+    ema: Optional[ModelEMA] = None,
+    split: str = "train",
+):
     model.eval()
     if ema is not None:
         ema.store(model)
@@ -266,6 +462,7 @@ def log_difficulty(model: nn.Module, loader: DataLoader, device: torch.device, p
                 rows.append(
                     {
                         "image_id": int(indices[row]),
+                        "split": split,
                         "true_label": int(targets[row]),
                         "predicted_label": int(pred[row]),
                         "loss": float(losses[row]),
@@ -281,8 +478,9 @@ def log_difficulty(model: nn.Module, loader: DataLoader, device: torch.device, p
         if ema is not None:
             ema.restore(model)
     frame = pd.DataFrame(rows).sort_values("image_id")
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(path, index=False)
+    if path is not None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(path, index=False)
     return frame
 
 
@@ -309,7 +507,15 @@ def log_confusion(model: nn.Module, loader: DataLoader, device: torch.device, pa
 
 
 @torch.no_grad()
-def log_predictions(model: nn.Module, loader: DataLoader, device: torch.device, path: str, num_classes: int, ema=None):
+def log_predictions(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    path: str,
+    num_classes: int,
+    ema=None,
+    tta: bool = False,
+):
     """Write final predictions and return the corresponding confusion matrix."""
     model.eval()
     if ema is not None:
@@ -319,7 +525,7 @@ def log_predictions(model: nn.Module, loader: DataLoader, device: torch.device, 
     matrix = torch.zeros((num_classes, num_classes), dtype=torch.int64)
     try:
         for images, targets, indices in loader:
-            logits = model(images.to(device, non_blocking=True))
+            logits = predict_logits(model, images.to(device, non_blocking=True), tta=tta)
             probabilities = logits.softmax(dim=1)
             confidence, predictions = probabilities.max(dim=1)
             for index, target, prediction, score in zip(indices, targets, predictions.cpu(), confidence.cpu()):
@@ -338,6 +544,41 @@ def log_predictions(model: nn.Module, loader: DataLoader, device: torch.device, 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).sort_values("image_id").to_csv(path, index=False)
     return pd.DataFrame(matrix.numpy())
+
+
+def save_confusion_plot(matrix: pd.DataFrame, path: str, title: str) -> None:
+    """Save the required visual artifact without making matplotlib import-time mandatory."""
+    import matplotlib.pyplot as plt
+
+    figure, axis = plt.subplots(figsize=(10, 9), dpi=160)
+    image = axis.imshow(matrix.to_numpy(), interpolation="nearest", cmap="Blues")
+    figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+    axis.set(title=title, xlabel="Predicted label", ylabel="True label")
+    figure.tight_layout()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path)
+    plt.close(figure)
+
+
+def average_state_dicts(paths: Iterable[str | os.PathLike[str]]) -> Dict[str, torch.Tensor]:
+    paths = [Path(path) for path in paths]
+    if not paths:
+        raise ValueError("at least one checkpoint is required for averaging")
+    states = []
+    for path in paths:
+        payload = torch.load(path, map_location="cpu")
+        states.append(payload.get("model_state_dict", payload) if isinstance(payload, dict) else payload)
+    keys = set(states[0])
+    if any(set(state) != keys for state in states[1:]):
+        raise ValueError("checkpoint state_dict keys do not match")
+    result = {}
+    for key in states[0]:
+        values = [state[key] for state in states]
+        if values[0].is_floating_point():
+            result[key] = torch.stack([value.float() for value in values]).mean(dim=0).to(values[0].dtype)
+        else:
+            result[key] = values[-1].clone()
+    return result
 
 
 def sample_weights_from_csv(path: str, dataset_size: int, alpha: float, max_weight: float) -> torch.Tensor:
